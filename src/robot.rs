@@ -1,6 +1,6 @@
 use crate::types::{MAP_SIZE, TileType, RobotType, RobotMode};
 use crate::map::Map;
-use crate::station::Station;
+use crate::station::{Station, TerrainData};
 use rand::prelude::*;
 use std::collections::{VecDeque, BinaryHeap, HashMap};
 use std::cmp::Ordering;
@@ -36,8 +36,12 @@ pub struct Robot {
     pub scientific_data: u32,
     pub robot_type: RobotType,
     pub mode: RobotMode,
-    pub memory: Vec<Vec<bool>>, // Carte mémoire (true = exploré)
+    pub memory: Vec<Vec<TerrainData>>, // Mémoire du robot avec timestamps
     pub path_to_station: VecDeque<(usize, usize)>, // Chemin vers la destination
+    pub id: usize,                     // Identifiant unique du robot
+    pub home_station_x: usize,         // Coordonnées X de la station d'origine
+    pub home_station_y: usize,         // Coordonnées Y de la station d'origine
+    pub last_sync_time: u32,           // Dernière synchronisation avec la station
 }
 
 impl Robot {
@@ -50,6 +54,21 @@ impl Robot {
             RobotType::ScientificCollector => (60.0, 60.0), // Collecteur scientifique: faible endurance
         };
         
+        // Initialiser une mémoire vide
+        let mut memory = Vec::with_capacity(MAP_SIZE);
+        for _ in 0..MAP_SIZE {
+            let row = vec![
+                TerrainData {
+                    explored: false,
+                    timestamp: 0,
+                    robot_id: 0,
+                    robot_type: RobotType::Explorer,
+                }; 
+                MAP_SIZE
+            ];
+            memory.push(row);
+        }
+        
         Self {
             x,
             y,
@@ -59,8 +78,47 @@ impl Robot {
             scientific_data: 0,
             robot_type,
             mode: RobotMode::Exploring, // Commencer directement en mode exploration
-            memory: vec![vec![false; MAP_SIZE]; MAP_SIZE], // Aucune case explorée au début
+            memory,
             path_to_station: VecDeque::new(),
+            id: 0, // Sera défini par la station
+            home_station_x: x,
+            home_station_y: y,
+            last_sync_time: 0,
+        }
+    }
+    
+    // Constructeur avec mémoire préchargée (pour la création par la station)
+    pub fn new_with_memory(
+        x: usize, 
+        y: usize, 
+        robot_type: RobotType, 
+        id: usize,
+        station_x: usize,
+        station_y: usize,
+        memory: Vec<Vec<TerrainData>>
+    ) -> Self {
+        let (max_energy, energy) = match robot_type {
+            RobotType::Explorer => (80.0, 80.0),
+            RobotType::EnergyCollector => (120.0, 120.0),
+            RobotType::MineralCollector => (100.0, 100.0),
+            RobotType::ScientificCollector => (60.0, 60.0),
+        };
+        
+        Self {
+            x,
+            y,
+            energy,
+            max_energy,
+            minerals: 0,
+            scientific_data: 0,
+            robot_type,
+            mode: RobotMode::Exploring,
+            memory,
+            path_to_station: VecDeque::new(),
+            id,
+            home_station_x: station_x,
+            home_station_y: station_y,
+            last_sync_time: 0,
         }
     }
     
@@ -85,9 +143,14 @@ impl Robot {
     }
     
     // Mise à jour de la mémoire (exploration)
-    pub fn update_memory(&mut self, map: &Map) {
-        // Marquer la case actuelle comme explorée
-        self.memory[self.y][self.x] = true;
+    pub fn update_memory(&mut self, map: &Map, station: &Station) {
+        // Marquer la case actuelle comme explorée avec timestamp
+        self.memory[self.y][self.x] = TerrainData {
+            explored: true,
+            timestamp: station.current_time,
+            robot_id: self.id,
+            robot_type: self.robot_type,
+        };
         
         // Explorer les cases adjacentes (vision)
         let vision_range = match self.robot_type {
@@ -101,7 +164,21 @@ impl Robot {
                 let ny = self.y as isize + dy;
                 
                 if nx >= 0 && nx < MAP_SIZE as isize && ny >= 0 && ny < MAP_SIZE as isize {
-                    self.memory[ny as usize][nx as usize] = true;
+                    let nx = nx as usize;
+                    let ny = ny as usize;
+                    
+                    // Si la case n'est pas encore explorée ou si notre info est plus récente
+                    if !self.memory[ny][nx].explored || 
+                       self.memory[ny][nx].timestamp < station.current_time {
+                        
+                        // Mettre à jour avec les connaissances actuelles
+                        self.memory[ny][nx] = TerrainData {
+                            explored: true,
+                            timestamp: station.current_time,
+                            robot_id: self.id,
+                            robot_type: self.robot_type,
+                        };
+                    }
                 }
             }
         }
@@ -123,20 +200,26 @@ impl Robot {
             // Si aucune ressource de son type n'est disponible, retourner à la station
             if self.find_nearest_resource(map).is_none() {
                 // S'il n'est pas déjà à la station
-                if self.x != map.station_x || self.y != map.station_y {
+                if self.x != self.home_station_x || self.y != self.home_station_y {
                     self.mode = RobotMode::ReturnToStation;
                     self.plan_path_to_station(map);
                 }
             }
         }
         
-        // Si à la station, recharger et changer de mode
-        if self.x == map.station_x && self.y == map.station_y {
+        // Si à la station, recharger, synchroniser et changer de mode
+        if self.x == self.home_station_x && self.y == self.home_station_y {
             // Recharger et décharger
             self.energy = self.max_energy;
             station.deposit_resources(self.minerals, self.scientific_data);
             self.minerals = 0;
             self.scientific_data = 0;
+            
+            // Synchroniser les connaissances avec la station
+            if station.current_time > self.last_sync_time {
+                station.share_knowledge(self);
+                self.last_sync_time = station.current_time;
+            }
             
             // Changer de mode après avoir rechargé
             match self.robot_type {
@@ -215,7 +298,7 @@ impl Robot {
                     self.move_to(next.0, next.1);
                 } else {
                     // Si le chemin est vide mais qu'on n'est pas à la station, replanifier
-                    if self.x != map.station_x || self.y != map.station_y {
+                    if self.x != self.home_station_x || self.y != self.home_station_y {
                         self.plan_path_to_station(map);
                         if !self.path_to_station.is_empty() {
                             let next = self.path_to_station.pop_front().unwrap();
@@ -233,7 +316,7 @@ impl Robot {
         }
         
         // Mettre à jour la mémoire
-        self.update_memory(map);
+        self.update_memory(map, station);
     }
     
     // Déplacement d'exploration intelligent
@@ -245,7 +328,7 @@ impl Robot {
         for y in 0..MAP_SIZE {
             for x in 0..MAP_SIZE {
                 // Si la case n'est pas explorée
-                if !self.memory[y][x] {
+                if !self.memory[y][x].explored {
                     // Calculer la distance avec la position actuelle
                     let distance = self.heuristic((self.x, self.y), (x, y));
                     if distance <= vision_range {
@@ -353,7 +436,7 @@ impl Robot {
     
     // Planifier un chemin vers la station
     fn plan_path_to_station(&mut self, map: &Map) {
-        let target = (map.station_x, map.station_y);
+        let target = (self.home_station_x, self.home_station_y);
         self.path_to_station = self.find_path(map, target);
     }
     
@@ -501,5 +584,20 @@ impl Robot {
         // Mettre à jour la position
         self.x = x;
         self.y = y;
+    }
+    
+    // Calculer le pourcentage de la carte exploré par ce robot
+    pub fn get_exploration_percentage(&self) -> f32 {
+        let mut explored_count = 0;
+        
+        for y in 0..MAP_SIZE {
+            for x in 0..MAP_SIZE {
+                if self.memory[y][x].explored {
+                    explored_count += 1;
+                }
+            }
+        }
+        
+        (explored_count as f32 / (MAP_SIZE * MAP_SIZE) as f32) * 100.0
     }
 }

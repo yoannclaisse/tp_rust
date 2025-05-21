@@ -33,29 +33,35 @@ impl Display {
                 } else if let Some(robot) = robot_here {
                     // Afficher le robot avec sa couleur
                     stdout.execute(SetForegroundColor(Color::AnsiValue(robot.get_display_color())))?;
-                    print!("{}:", robot.get_display_char());
+                    print!("{}{}",robot.get_display_char(), robot.id);
                 } else {
-                    match map.get_tile(x, y) {
-                        TileType::Empty => {
-                            stdout.execute(SetForegroundColor(Color::White))?;
-                            print!("· ");
-                        },
-                        TileType::Obstacle => {
-                            stdout.execute(SetForegroundColor(Color::DarkGrey))?;
-                            print!("██");
-                        },
-                        TileType::Energy => {
-                            stdout.execute(SetForegroundColor(Color::Green))?;
-                            print!("♦ ");
-                        },
-                        TileType::Mineral => {
-                            stdout.execute(SetForegroundColor(Color::Magenta))?;
-                            print!("★ ");
-                        },
-                        TileType::Scientific => {
-                            stdout.execute(SetForegroundColor(Color::Blue))?;
-                            print!("○ ");
-                        },
+                    // Définir la couleur de base de la tuile
+                    let base_color = match map.get_tile(x, y) {
+                        TileType::Empty => Color::White,
+                        TileType::Obstacle => Color::DarkGrey,
+                        TileType::Energy => Color::Green,
+                        TileType::Mineral => Color::Magenta,
+                        TileType::Scientific => Color::Blue,
+                    };
+                    
+                    // Vérifier si la case est explorée dans la mémoire de la station
+                    let is_explored_by_station = station.global_memory[y][x].explored;
+                    
+                    // Modifier l'affichage en fonction de la connaissance
+                    if is_explored_by_station {
+                        stdout.execute(SetForegroundColor(base_color))?;
+                        
+                        match map.get_tile(x, y) {
+                            TileType::Empty => print!("· "),
+                            TileType::Obstacle => print!("██"),
+                            TileType::Energy => print!("♦ "),
+                            TileType::Mineral => print!("★ "),
+                            TileType::Scientific => print!("○ "),
+                        }
+                    } else {
+                        // Zone non explorée par la station
+                        stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+                        print!("? ");
                     }
                 }
             }
@@ -73,7 +79,9 @@ impl Display {
         // Ajouter le statut de la station
         stdout.execute(MoveTo(0, MAP_SIZE as u16 + 2))?;
         stdout.execute(SetForegroundColor(Color::White))?;
-        println!("Statut: {}", station.get_status());
+        println!("Statut: {} | Carte explorée: {:.1}%", 
+            station.get_status(),
+            station.get_exploration_percentage());
         
         // Afficher les informations de chaque robot
         for (i, robot) in robots.iter().enumerate() {
@@ -94,9 +102,9 @@ impl Display {
                 RobotMode::Idle => "Inactif",
             };
             
-            println!("Robot {}: {} | Énergie: {:.1}/{:.1} | Mode: {} | Min: {} | Sci: {}", 
-                    i + 1, robot_type, robot.energy, robot.max_energy, mode, 
-                    robot.minerals, robot.scientific_data);
+            println!("Robot #{}: {} | Énergie: {:.1}/{:.1} | Mode: {} | Min: {} | Sci: {} | Exploré: {:.1}%", 
+                    robot.id, robot_type, robot.energy, robot.max_energy, mode, 
+                    robot.minerals, robot.scientific_data, robot.get_exploration_percentage());
         }
         
         // Afficher la légende
@@ -110,16 +118,16 @@ impl Display {
         print!("[] = Station   ");
         
         stdout.execute(SetForegroundColor(Color::AnsiValue(9)))?;
-        print!("E: = Explorateur   ");
+        print!("E# = Explorateur   ");
         
         stdout.execute(SetForegroundColor(Color::AnsiValue(10)))?;
-        print!("P: = Collecteur d'énergie   ");
+        print!("P# = Collecteur d'énergie   ");
         
         stdout.execute(SetForegroundColor(Color::AnsiValue(13)))?;
-        print!("M: = Collecteur de minerais   ");
+        print!("M# = Collecteur de minerais   ");
         
         stdout.execute(SetForegroundColor(Color::AnsiValue(12)))?;
-        println!("S: = Collecteur scientifique");
+        println!("S# = Collecteur scientifique");
         
         stdout.execute(MoveTo(0, legend_y + 2))?;
         stdout.execute(SetForegroundColor(Color::Green))?;
@@ -132,7 +140,10 @@ impl Display {
         print!("○ = Intérêt scientifique   ");
         
         stdout.execute(SetForegroundColor(Color::DarkGrey))?;
-        println!("██ = Obstacle");
+        print!("██ = Obstacle   ");
+        
+        stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+        println!("? = Non exploré");
         
         stdout.flush()?;
         Ok(())
