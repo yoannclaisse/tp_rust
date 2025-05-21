@@ -1,0 +1,11 @@
+[package]
+name = "ereea"
+version = "0.1.0"
+edition = "2021"
+authors = ["Votre nom <votre.email@example.com>"]
+description = "Essaim de Robots pour l'Exploration et l'Étude Astrobiologique"
+
+[dependencies]
+crossterm = "0.27"
+noise = "0.8"
+rand = "0.8"
