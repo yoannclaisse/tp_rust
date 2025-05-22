@@ -10,6 +10,7 @@ use std::{thread, time::Duration};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
+use std::process;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -87,6 +88,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (state_tx, mut state_rx) = mpsc::channel::<SimulationState>(100);
     println!("Canaux de communication configurés avec succès.");
     
+    // Canal pour signaler la fin de mission
+    let (mission_complete_tx, mut mission_complete_rx) = mpsc::channel::<bool>(1);
+    
     // Thread de simulation
     println!("Étape 7: Démarrage du thread de simulation...");
     let map_for_sim = map.clone();
@@ -99,6 +103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Thread de simulation démarré.");
         let mut iteration = 0;
         let mut last_robot_creation = 0;
+        let mut mission_complete = false;
+        
+        // Seuil d'exploration pour considérer la mission comme réussie (95%)
+        const EXPLORATION_THRESHOLD: f32 = 95.0;
         
         loop {
             if iteration % 10 == 0 {
@@ -109,6 +117,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match station_for_sim.lock() {
                 Ok(mut station_lock) => {
                     station_lock.tick();
+                    
+                    // Vérifier si la mission est complète
+                    let exploration_percentage = station_lock.get_exploration_percentage();
+                    if exploration_percentage >= EXPLORATION_THRESHOLD && !mission_complete {
+                        println!("\n!!! EXPLORATION COMPLÈTE À {:.1}% !!!\n", exploration_percentage);
+                        println!("Rappel des robots à la station...");
+                        mission_complete = true;
+                        
+                        // Rappeler tous les robots à la station sans appeler la méthode privée
+                        if let Ok(mut robots_lock) = robots_for_sim.lock() {
+                            for robot in robots_lock.iter_mut() {
+                                // Simplement changer le mode - la méthode update s'occupera du reste
+                                robot.mode = RobotMode::ReturnToStation;
+                            }
+                        }
+                    }
+                    
+                    // Si tous les robots sont à la station après que la mission est complète, 
+                    // envoyer le signal de fin de mission
+                    if mission_complete {
+                        let all_robots_at_station = {
+                            if let Ok(robots_lock) = robots_for_sim.lock() {
+                                robots_lock.iter().all(|r| r.x == r.home_station_x && r.y == r.home_station_y)
+                            } else {
+                                false
+                            }
+                        };
+                        
+                        if all_robots_at_station {
+                            println!("\n!!! MISSION ACCOMPLIE !!!\n");
+                            println!("Tous les robots sont de retour à la station.");
+                            println!("EXOPLANÈTE ENTIÈREMENT DÉCOUVERTE À VOUS LA TERRE !!!");
+                            println!("Transmission des données finales...");
+                            
+                            // Notifier la boucle principale que la mission est terminée
+                            if let Err(e) = mission_complete_tx.blocking_send(true) {
+                                eprintln!("Erreur lors de l'envoi du signal de fin de mission: {:?}", e);
+                            }
+                            
+                            // Attendre un peu pour s'assurer que le message est envoyé
+                            thread::sleep(Duration::from_secs(2));
+                            break;
+                        }
+                    }
                 },
                 Err(e) => {
                     eprintln!("Erreur lors du verrouillage de la station: {:?}", e);
@@ -137,7 +189,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         
                         // Vérifier si la station peut créer un nouveau robot (tous les 50 cycles)
-                        if iteration - last_robot_creation >= 50 {
+                        // Mais seulement si la mission n'est pas complète
+                        if iteration - last_robot_creation >= 50 && !mission_complete {
                             if let Some(new_robot) = station_lock.try_create_robot(&map_lock) {
                                 robots_lock.push(new_robot);
                                 last_robot_creation = iteration;
@@ -255,18 +308,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     // Accepter les connexions entrantes
     println!("Serveur prêt à accepter des connexions. En attente...");
-    loop {
-        match listener.accept().await {
-            Ok((stream, addr)) => {
-                println!("Nouvelle connexion: {}", addr);
-                // Ajouter le nouveau client à la liste - avec TokioMutex c'est async-safe
-                let mut streams = client_streams.lock().await;
-                streams.push(stream);
-                println!("Client ajouté à la liste. Nombre total de clients: {}", streams.len());
+    
+    // Boucle d'acceptation des connexions qui s'exécute jusqu'à ce que la mission soit complète
+    tokio::select! {
+        _ = async {
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        println!("Nouvelle connexion: {}", addr);
+                        // Ajouter le nouveau client à la liste - avec TokioMutex c'est async-safe
+                        let mut streams = client_streams.lock().await;
+                        streams.push(stream);
+                        println!("Client ajouté à la liste. Nombre total de clients: {}", streams.len());
+                    }
+                    Err(e) => {
+                        eprintln!("Erreur lors de l'acceptation d'une connexion: {:?}", e);
+                    }
+                }
             }
-            Err(e) => {
-                eprintln!("Erreur lors de l'acceptation d'une connexion: {:?}", e);
+        } => {},
+        
+        _ = async {
+            // Attendre le signal de fin de mission
+            if mission_complete_rx.recv().await.is_some() {
+                println!("\n=== FIN DE LA MISSION ===\n");
+                // Attendre un peu pour que les derniers messages soient envoyés
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                println!("Fermeture du serveur...");
             }
+        } => {
+            // Mission complète, terminer le programme
+            return Ok(());
         }
     }
+    
+    Ok(())
 }
